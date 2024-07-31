@@ -1,6 +1,6 @@
 This repo holds analyses used in the manuscript, "Single cell spatial transcriptomic profiling of childhood-onset lupus nephritis reveals complex interactions between kidney stroma and infiltrating immune cells".
 
-Note: the datasets used here are too big to host on github. They can be downloaded from Figshare at: _____________________________________. 
+Note: the datasets used here are too big to host on github. They can be downloaded from Figshare [here](https://doi.org/10.6084/m9.figshare.c.7373860). 
 
 How to use:
 
