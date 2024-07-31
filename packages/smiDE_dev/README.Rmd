@@ -1,0 +1,293 @@
+---
+title: "Example DE usage"
+author: "Dan McGuire"
+date: "`r Sys.Date()`"
+output: rmarkdown::github_document
+vignette: >
+  %\VignetteIndexEntry{Selectorgadget}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+```{r,echo=F} 
+# output: rmarkdown::html_vignette
+library(knitr)
+opts_chunk$set(comment = "#>", collapse = TRUE)
+hook_output = knit_hooks$get('output')
+knit_hooks$set(output = function(x, options) {
+  if (!is.null(n <- options$out.lines)) {
+    x = knitr:::split_lines(x)
+    if (length(x) > n) {
+      # truncate the output
+      h = c(head(x, n), '....\n','....\n')
+      t = c(tail(x, n))
+      x = c(h, t)
+    }
+    x = paste(x, collapse = '\n') # paste first n lines together
+  }
+  hook_output(x, options)
+})
+#opts_chunk$set(eval=FALSE)
+#Rscript -e "rmarkdown::render('mamba_example/example_mamba_analysis.Rmd')"
+```
+
+
+```{r}
+library(data.table); setDTthreads(1)
+library(smiDE)
+```
+
+### 0. Load example dataset
+A small subset of giotto object from NSCLC data.
+This is FOV 1 from Lung6, Lung12, and Lung13.
+```{r}
+datadir <- system.file("extdata", package="smiDE")
+gem <- readRDS(paste0(datadir, "/small_nsclc.rds"))
+
+```
+
+### 1. pre-de step: Calculate all cell-cell neighbors within a specified radius of each other. For a cell-type of interest, calculate expression of genes in neighbors of those cells. 
+
+This can be done in one step. For example, if one wanted to find DE genes in fibroblast cells, comparing spatial regions specified by the column `niche` in the meta data.
+
+
+```{r}
+config_pre_de <- list(assay = "rna"
+                       ,counts = "raw" 
+                       ,normalized = "normalized"
+                       ,cellid_colname = "cell_ID"
+                       ,cell_type_metadata_colname = "cell_type"
+                       ,split_neighbors_by_colname = "tissue"
+                       ,mm_radius = 0.05
+                       ,ref_celltype = "fibroblast"
+                       ,sdimx_colname = "sdimx"
+                       ,sdimy_colname = "sdimy"
+                       ,weight_colname = "weight"
+                       ,contamination = "sum"
+                       ,verbose=TRUE
+                       )
+
+pre_de_obj <- run_pre_de(gem, config_pre_de) 
+names(pre_de_obj)
+```
+
+The `config_de` below specifies the model formula, for a negative binomial regression, where for each gene, we include the expression of neighboring cells which are not fibroblasts as a covariate to adjust for.  `niche` is a primary variable of interest, and tissue is a fixed effect below which accounts for some gene expression attributable to differences in the tissue / biological sample rather than the spatial region (`niche`).
+
+If we remove the `targets` parameter or set to `NULL`, then a model would be fit for all genes.
+```{r,echo=TRUE}
+config_de <- list(
+                   assay = "rna"
+                  ,data_use = "raw"
+                  ,formula = ~RankNorm(otherct_expr) + niche + tissue + offset(log(totalcounts))
+                  ,groupVar="niche"
+                  ,family="nbinom2"
+                  ,targets=rownames(gem@expression$rna$raw)[1:20]
+                  )
+
+de_obj <- 
+  run_de(gem, pre_de_obj, config_de)
+
+
+```
+
+
+Fit negative binomial mixed models, with random effect for tissue variable instead of a fixed effects.
+```{r,echo=TRUE}
+config_de <- list(
+                   assay = "rna"
+                  ,data_use = "raw"
+                  ,formula = ~RankNorm(otherct_expr) + niche + (1 | tissue) + offset(log(totalcounts))
+                  ,groupVar="niche"
+                  ,family="nbinom2"
+                  ,targets=rownames(gem@expression$rna$raw)[1:20]
+                  )
+
+de_obj_mixedmod <- 
+  run_de(gem, pre_de_obj, config_de)
+
+
+```
+
+Note here that we are fitting models with a very small (1,097) number of cells, and with all categories of niche (), some of which have few cells per niche, which can cause stability issues in model fitting. 
+```{r}
+gem@cell_metadata$rna[,.N,by=.(cell_type,niche)][order(-N)][cell_type=="fibroblast"]
+gem@cell_metadata$rna[cell_type=="fibroblast",.N,by=.(cell_type,niche)][,sum(N)]
+```
+To check out the results, we can use the `results` function.
+
+Some documentation on options here:
+```{r}
+help(results)
+```
+
+
+For example, to look at comparisons of each spatial `niche` compared to others:
+```{r}
+results(de_obj, comparisons = "one.vs.rest", variable = "niche")
+```
+
+```{r}
+results(de_obj_mixedmod, comparisons = "one.vs.rest", variable = "niche")
+```
+To get pairwise comparisons for fold change comparing tissue.
+```{r}
+results(de_obj, comparisons="pairwise", variable="tissue")[[1]][1:10]
+```
+
+To check out the model summary, say for the "ADGRB2" gene which gave a warning for 'bad fit'
+```{r}
+results(de_obj, comparisons="model_summary", targets="ADGRB2")$model_summary
+```
+
+Compare with the 'AATK' gene, which didn't give a warning.
+```{r}
+results(de_obj, comparisons="model_summary", targets="AATK")$model_summary
+```
+
+
+
+
+## Deeper explanations...
+##### The pre_de step:
+
+The object `pre_de_obj$cell_adjacency_dt` contains a row for each pair of cells within the 0.05 distance of each other specified by `mm_radius=0.05`.  The `split_neighbors_by_colname=tissue` specifies that neighbors are calculated separately by by the column in meta data named "tissue".
+
+```{r}
+
+config_pre_de <- list(assay = "rna"
+                       ,counts = "raw" 
+                       ,normalized = "normalized"
+                       ,cellid_colname = "cell_ID"
+                       ,cell_type_metadata_colname = "cell_type"
+                       ,split_neighbors_by_colname = "tissue"
+                       ,mm_radius = 0.05
+                       ,ref_celltype = "fibroblast"
+                       ,sdimx_colname = "sdimx"
+                       ,sdimy_colname = "sdimy"
+                       ,weight_colname = "weight"
+                       ,contamination = "sum"
+                       ,verbose=TRUE
+                       )
+
+
+show <-copy(pre_de_obj$cell_adjacency_dt)
+show <- merge(show, gem@cell_metadata$rna[,.(from=cell_ID,cell_type_from = cell_type)], by="from", sort=FALSE)
+show <- merge(show, gem@cell_metadata$rna[,.(to=cell_ID,cell_type_to = cell_type)], by="to", sort=FALSE)
+show[]
+
+```
+
+
+
+
+
+Because the ref_celltype is specified as fibroblast (`ref_celltype=fibroblast`), the total normalized, distance weighted expression of each gene is calculated for the neighbors of each of the 1097 fibroblast cells in this small sample dataset.
+
+```{r}
+lapply(pre_de_obj$nblist$neighbor_expr_byct, dim)
+```
+This is calculated separately for all of the cell types.  For example, the total expression of endothelial cells which are the neighbors of the fibroblast cells can be accessed like this.
+```{r}
+pre_de_obj$nblist$neighbor_expr_byct$endothelial[1:20,1:20]
+```
+
+There's also a list for expression from any cell type *other* than the fibroblast cells (*otherct*).
+There's also a list for expression from all cell types including other fibroblast cells (*allct*).
+
+```{r}
+pre_de_obj$nblist$neighbor_expr_byct$otherct[1:10,1:10]
+pre_de_obj$nblist$neighbor_expr_byct$allct[1:10,1:10]
+```
+
+Using the *normalized* counts and weighting the expression by it's distance to the cell of interest (`weight_colname="weight"`) was found to work well in some real applications and is set as a default. In some applications, this helped best for controlling known false positive genes that were initially indicated to be DE due to cell-typing or cell-segmentation error. 
+
+Under the hood , calculations are done using the function `measure_neighbor_expression_by_celltype`.  It can be easier to visualize if we look at raw counts which are not weighted by distance.
+
+```{r}
+
+metainfo <- copy(gem@cell_metadata$rna)
+metainfo <- merge(metainfo, gem@spatial_locs$raw, by="cell_ID")
+nblist_raw_unweighted <- 
+  measure_neighbor_expression_by_celltype(
+                                          assay_matrix = gem@expression$rna$raw
+                                          ,metadata = metainfo
+                                          ,cell_adjacencies = pre_de_obj$cell_adjacency_dt
+                                          ,contamination = "sum"
+                                          ,weight_colname = NULL
+                                          ,ref_celltype = "fibroblast"
+                                          ,cellid_colname = "cell_ID"
+                                          ,cell_type_metadata_colname = "cell_type"
+                                          )
+
+
+
+```
+Using the neighbor cell expression, we can decompose how much a gene is expressed in neighboring cells, and by which cell types.  
+For example, looking at the tumor gene "KRT17", we can see that most of the expressionof KRT17 in cells which are neighbors to fibroblast cells are coming from tumor cells. 
+```{r}
+krt17_neighbor_expr <- 
+  extract_neighborexpr_by_gene(nblist_raw_unweighted$neighbor_expr_byct, gene= "KRT17")
+
+krt17_neighbor_expr[1:5]
+```
+
+A few other notes on the 'nblist_raw_unweighted' object.  
+
+The object 'adjacency_mat' is a sparse matrix indicating which cells are neighbors/within 0.05 distance of each other.
+```{r}
+nblist_raw_unweighted$adjacency_mat[1:10,1:10]
+```
+
+The object 'adjacency_counts_by_ct' indicates how many cells of each cell type are 'neighbors' of each fibroblast cell.
+```{r}
+nblist_raw_unweighted$adjacency_counts_by_ct
+nblist_raw_unweighted$adjacency_counts_by_ct[,lapply(.SD,sum),.SDcols=1:22]
+```
+
+#### Modeling options
+
+It's possible to specify a number of different DE models.
+
+In addition to trying different likelihoods (`family`) argument, any of the cell types in the 'nblist' with '_expr' suffix are available to use as arguments in modeling formula.
+
+```{r}
+
+## Neg binomial regression on raw counts adjusting specifically for neighboring expression in certain class of *tumor* cells
+nbmod <- 
+smi_de(assay_matrix = gem@expression$rna$raw
+       ,metadata=metainfo
+       ,neighborhood_counts = pre_de_obj$nblist
+       ,groupVar="niche"
+       ,targets="KRT17"
+       ,formula = ~niche + tumor_12_expr  + offset(log(totalcounts))
+       ,family="nbinom2"
+       )
+
+results(nbmod, comparisons="model_summary")
+
+## Linear regression on normalized counts adjusting specifically for neighboring expression in certain class of *tumor* cells.  And a random effect for tissue.
+
+linearmod <- 
+smi_de(assay_matrix = gem@expression$rna$raw
+       ,metadata=metainfo
+       ,neighborhood_counts = pre_de_obj$nblist
+       ,groupVar="niche"
+       ,targets="KRT17"
+       ,formula = ~niche + tumor_12_expr + (1|tissue) 
+       ,family="gaussian"
+       )
+
+results(linearmod, comparisons="model_summary")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+

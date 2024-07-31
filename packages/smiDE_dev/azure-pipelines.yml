@@ -1,0 +1,52 @@
+trigger:
+  branches:
+    include:
+      - dev
+
+resources:
+- repo: self
+
+variables:
+  isDevelop: ${{eq(variables['Build.SourceBranch'], 'refs/heads/dev')}}
+  group: smida-build-pipeline-devnext-variables
+
+stages:
+- stage: Build
+  displayName: Build Docker image
+  jobs:
+  - job: Build_image
+    displayName: Build Docker image
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      - group: smida-build-pipeline-devnext-variables
+    steps:
+    - task: ECRPullImage@1
+      displayName: Pull NanoPipeline Build environment image from DEVNEXT HUB ECR
+      inputs:
+        awsCredentials: 'atomx-aws-devnext-hub'
+        regionName: '$(AWS_REGION)'
+        repository: 'ecr-cac1-devnext-cosmx_da_repo-devnext-hub-smida-nanopipeline-build-environment'
+        imageSource: 'imagetag'
+        imageTag: 'latest'
+    - task: Bash@3
+      displayName: Run smida-nanopipeline-build-environment Docker Image
+      inputs:
+        targetType: 'inline'
+        script: |
+          docker run --rm -v "$(Build.SourcesDirectory)":"/source" $(DEVNEXT_HUB_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/ecr-cac1-devnext-cosmx_da_repo-devnext-hub-smida-nanopipeline-build-environment:latest
+    - task: Bash@3
+      displayName: Copy .tar.gz file as latest
+      inputs:
+        targetType: 'inline'
+        script: |
+          cp *.tar.gz smiDE_latest.tar.gz
+    - task: S3Upload@1
+      displayName: Upload DE .tar.gz files to S3 on DEVNEXT HUB
+      inputs:
+        awsCredentials: 'atomx-aws-devnext-hub'
+        regionName: '$(AWS_REGION)'
+        bucketName: 's3-cac1-devnext-smida-assets-global-devnext'
+        sourceFolder: '$(Build.SourcesDirectory)'
+        globExpressions: 'smiDE_*.tar.gz'
+        targetFolder: 'smida/assets/nanopipeline'
