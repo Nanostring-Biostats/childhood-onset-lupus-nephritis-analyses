@@ -1,0 +1,40 @@
+# install packages if unloaded
+ensurePackage <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# load
+library(Seurat)
+ensurePackage('plyr')
+ensurePackage('dplyr')
+ensurePackage('ggplot2')
+ensurePackage('ggpubr')
+ensurePackage('MLEcell')
+ensurePackage('sparseMatrixStats')
+ensurePackage('reshape2')
+ensurePackage('gridExtra')
+ensurePackage('patchwork')
+ensurePackage('scales')
+ensurePackage('RColorBrewer')
+ensurePackage('extrafont')
+ensurePackage('corrr')
+ensurePackage('gtools')
+ensurePackage('igraph')
+ensurePackage('corrplot')
+ensurePackage('pheatmap')
+ensurePackage('BiocManager')
+ensurePackage('clusterProfiler')
+ensurePackage('org.Hs.eg.db')
+ensurePackage('AnnotationDbi')
+#ensurePackage('SeuratData')
+ensurePackage('usedist')
+ensurePackage('lmtest')
+ensurePackage('sandwich')
+ensurePackage('broom')
+ensurePackage('batchelor')
+ensurePackage('SingleCellExperiment')
+ensurePackage('scan')
+ensurePackage('scater')

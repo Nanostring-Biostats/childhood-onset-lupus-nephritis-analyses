@@ -1,0 +1,18 @@
+# README Document for B cell subcluster analyses (9.0 - 9.2)
+Analyses were performed in R-markdown with R version 4.4.1 using Seurat version 4
+File 9.0 should be run in a separate instance of R from .R files 1-8
+Figures are saved to a "figures" directory
+Processed data are saved to a "processed_data" directory
+Other output is saved to the same directory as the .Rmd files
+
+# SessionInfo output:
+attached base packages:
+[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] scater_1.32.1               scuttle_1.14.0              scan_0.61.0                 batchelor_1.20.0            SingleCellExperiment_1.26.0 SummarizedExperiment_1.34.0 GenomicRanges_1.56.2        GenomeInfoDb_1.40.1        
+ [9] broom_1.0.6                 sandwich_3.1-1              lmtest_0.9-40               zoo_1.8-12                  usedist_0.4.0               org.Hs.eg.db_3.19.1         AnnotationDbi_1.66.0        IRanges_2.38.1             
+[17] S4Vectors_0.42.1            Biobase_2.64.0              BiocGenerics_0.50.0         clusterProfiler_4.12.6      BiocManager_1.30.25         pheatmap_1.0.12             corrplot_0.95               igraph_2.1.1               
+[25] gtools_3.9.5                corrr_0.4.4                 extrafont_0.19              RColorBrewer_1.1-3          scales_1.3.0                patchwork_1.3.0             gridExtra_2.3               reshape2_1.4.4             
+[33] sparseMatrixStats_1.16.0    MatrixGenerics_1.16.0       matrixStats_1.4.1           MLEcell_1.1.1               ggpubr_0.6.0                ggplot2_3.5.1               dplyr_1.1.4                 plyr_1.8.9                 
+[41] SeuratObject_4.1.4          Seurat_4.4.0   

@@ -1,0 +1,210 @@
+---
+title: "Bcell_MNN_Harmonization"
+author: "Nicholas Hasle"
+date: "2024-05-31"
+output: html_document
+---
+
+# Notebook Summary
+
+This notebook harmonizes B cell seurat object data with the data from Ma et al. using MNN batch correction
+
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+loadfonts('pdf')
+theme_set(theme_classic())
+my_theme <- theme(
+  text = element_text(family = 'ArialMT'),
+  axis.line = element_line(linewidth = 1),
+  axis.ticks = element_line(linewidth = 0.5),
+  axis.title = element_text(size = 10),
+  axis.text = element_text(size = 8),
+  legend.title = element_text(size = 8),
+  legend.text = element_text(size = 8)
+)
+theme_update(
+  text = element_text(family = 'ArialMT'),
+  axis.line = element_line(linewidth = 1),
+  axis.ticks = element_line(linewidth = 0.5),
+  axis.title = element_text(size = 10),
+  axis.text = element_text(size = 8),
+  legend.title = element_text(size = 8),
+  legend.text = element_text(size = 8))
+```
+
+
+# AMPseq consortium
+
+## Load and scale data
+
+```{r}
+# load 
+bcell_seurat <- readRDS('processed_data/bcell_seurat.RDS')
+amp_gene_matrix <- read.table('data/ampseq_gene_by_cell_exp_mat.736297.txt')
+amp_cell_ids <- read.table('data/ampseq_cluster_per_cell.736296.txt', header = T, row.names = 1)
+
+## alternatively, may try transforming amp_gene_matrix back to original count matrix
+amp_gene_matrix_alt <- 10^amp_gene_matrix
+
+## filter gene matrix data by B cell clusters of interets (cois)
+cois <- c('CB0', 'CB1', 'CB2a', 'CB3')
+amp_gene_matrix <- as.matrix(amp_gene_matrix[,row.names(subset(amp_cell_ids, cluster %in% cois))])
+
+# Find shared genes
+shared <- base::intersect(row.names(bcell_seurat), row.names(amp_gene_matrix))
+
+# Seurat object
+## Load the Seurat object
+amp_scrnaseq <- CreateSeuratObject(
+                    counts = amp_gene_matrix[shared,],
+                    project = "amp_cln",
+                    assay = "RNA",
+                    meta.data = data.frame(cluster = amp_cell_ids[colnames(amp_gene_matrix),],
+                                           row.names = colnames(amp_gene_matrix))
+)
+
+
+```
+
+## No batch correction
+
+```{r}
+
+# Find Ma et al variable features, which should drive clustering anyway
+amp_scrnaseq_sharedonly <- amp_scrnaseq[shared,]
+amp_scrnaseq_sharedonly <- NormalizeData(amp_scrnaseq_sharedonly)
+amp_scrnaseq_sharedonly <- FindVariableFeatures(amp_scrnaseq_sharedonly,
+                                               nfeatures = 250)
+amp_vargenes <- VariableFeatures(amp_scrnaseq_sharedonly)
+
+# Merge datasets
+both <- merge(x = CreateSeuratObject(
+                    counts = bcell_seurat@assays$nanostrRNA@counts[shared,],
+                    project = "cln_spatial",
+                    assay = "RNA",
+                    meta.data = bcell_seurat@meta.data),
+              y = CreateSeuratObject(
+                    counts = amp_scrnaseq@assays$RNA@counts[shared,],
+                    project = "amp_cln",
+                    assay = "RNA",
+                    meta.data = amp_scrnaseq@meta.data)
+)
+
+# Add column for data id
+both@meta.data$dataset <- "amp_cln"
+both@meta.data[which(both@meta.data$orig.ident == 'LN_spatial'),
+               'dataset'] <- 'cln_spatial'
+
+# Normalize the data
+both <- NormalizeData(both)
+
+# Scale data
+both <- ScaleData(both,
+                  features = amp_vargenes)
+
+# Run PCA
+both <- RunPCA(both,
+               features = amp_vargenes)
+
+## Check whether PCA is clearly separating samples
+DimPlot(both, reduction = 'pca', group.by = 'dataset')
+ElbowPlot(both)
+
+# Run UMAP
+both <- RunUMAP(both,
+                dims = 1:20)
+DimPlot(both, group.by = "cluster")
+
+
+```
+
+## MNN correction
+
+```{r}
+# Convert to sce
+both_sce <- as.SingleCellExperiment(both)
+
+
+# prepare important colData
+df <- colData(both_sce)[,c('bcell_subclust', 'cluster')]
+subclusts <- ifelse(is.na(df$bcell_subclust), df$cluster, df$bcell_subclust)
+
+# perform batch correction
+f.out <- fastMNN(both_sce,
+                 batch = colData(both_sce)$dataset)
+
+# Add PCA data back to seurat object
+## Extract PCA results
+pca_results <- reducedDim(f.out, "corrected")
+colnames(pca_results) <- paste0("PC_", seq(1:ncol(pca_results)))
+
+## Add back to seurat object
+both[['corrected']] <- CreateDimReducObject(embeddings = pca_results,
+                                            key = "corrected_",
+                                            assay = DefaultAssay(both))
+
+both <- RunUMAP(both,
+                dims = 1:20,
+                reduction = "corrected")
+
+```
+
+## Visualize subclusters
+
+### All subclusters together
+
+```{r}
+# Plot
+## prep data
+tmp <- cbind(both@meta.data,  both@reductions$umap@cell.embeddings)
+tmp <- as.data.frame(tmp)
+
+
+## plot the cln data and compare to ampseq contours
+ggplot(data = tmp,
+       aes(x = UMAP_1.1, y = UMAP_2.1)) +
+  geom_density2d(data = subset(tmp, dataset == 'amp_cln'),
+                 color = 'grey') +
+  geom_point(data = subset(tmp, dataset == 'cln_spatial'),
+             aes(color = bcell_subclust))
+
+## plot the amp seq data and compare to cln data contours
+ggplot(data = tmp,
+       aes(x = UMAP_1.1, y = UMAP_2.1)) +
+  geom_density2d(data = subset(tmp, dataset == 'cln_spatial'),
+                 color = 'grey') +
+  geom_point(data = subset(tmp, dataset == 'amp_cln'),
+             aes(color = cluster))
+
+
+## plot both datasets together
+tmp <- cbind(tmp[,c('dataset', 'bcell_subclust', 'cluster')], tmp[,c(ncol(tmp)-1, ncol(tmp))]) %>%
+  mutate(subclusters = coalesce(bcell_subclust, cluster))
+
+tmp$subclusters <- as.factor(tmp$subclusters)
+
+ggplot(tmp,
+       aes(x = UMAP_1,
+           y = UMAP_2,
+           color = subclusters)) +
+  geom_point(size = 0.75) +
+  scale_colour_manual(values = c('#bdd7e7','#6baed6','#3182bd','#08519c',
+                                 '#fdbe85','#fd8d3c','#e6550d','#a63603')) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(color = "Subcluster")
+
+## save the plot
+ggsave(filename = 'figures/bcell_ampseq_MNN_UMAP.svg',
+       width = 3,
+       height = 2.2,
+       units = "in",
+       device = svg)
+
+```
+
