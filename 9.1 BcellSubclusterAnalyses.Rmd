@@ -10,7 +10,7 @@ chunk_output_type: inline
 # Load packages and prep data
 ## Load packages
 ```{r Load packages}
-source('9. load_pkgs_BcellAnalysis.R')
+source('9.0 load_pkgs_BcellAnalysis.R')
 loadfonts('pdf')
 theme_set(theme_classic())
 my_theme <- theme(
