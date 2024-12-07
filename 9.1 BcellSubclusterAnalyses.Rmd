@@ -1,0 +1,1787 @@
+---
+title: "B cell Analyses for cLN CosMx Paper"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+chunk_output_type: inline
+---
+
+
+# Load packages and prep data
+## Load packages
+```{r Load packages}
+source('9.0 load_pkgs_BcellAnalysis.R')
+loadfonts('pdf')
+theme_set(theme_classic())
+my_theme <- theme(
+  text = element_text(family = 'ArialMT'),
+  axis.line = element_line(linewidth = 1),
+  axis.ticks = element_line(linewidth = 0.5),
+  axis.title = element_text(size = 10),
+  axis.text = element_text(size = 8),
+  legend.title = element_text(size = 8),
+  legend.text = element_text(size = 8)
+)
+theme_update(
+  text = element_text(family = 'ArialMT'),
+  axis.line = element_line(linewidth = 1),
+  axis.ticks = element_line(linewidth = 0.5),
+  axis.title = element_text(size = 10),
+  axis.text = element_text(size = 8),
+  legend.title = element_text(size = 8),
+  legend.text = element_text(size = 8))
+  
+
+```
+## Define custom functions
+
+### Spatial analysis functions
+#### Create adjacency matrix
+Function that creates an adjacency matrix by querying each cell for the cell types of each target cell within a certian distance X, then sums across each cell type.
+```{r}
+
+# Define function
+make_adj_mat <- function(
+  # output of dist function  
+  dist_obj, 
+  # named list of cell names and cell types
+  annot_list,
+  # distance
+  distX,
+  # collapse query cells? (i.e. columns)
+  collapse_query = T) {  
+  
+  ## retrieve matrix object from dist object
+  dmat <-as.matrix(dist_obj)
+  
+  ## iterate through each query cell
+  tmpmat <- sapply(colnames(dmat), function(cellid) {
+    
+    ### obtain all target cells within distX distance
+    cell <- dmat[,cellid]
+    cell_fil <- cell[which((cell < distX) & (cell != 0))]
+    ### get the cell type of each cell and count using the annot dataframe
+    out <- t(as.matrix(table(annot_list[names(cell_fil)])))
+    row.names(out) <- cellid
+    return(out)
+  })
+  
+  ## put all cells together
+  tmpmat <- rbind.fill.matrix(tmpmat)
+  row.names(tmpmat) <- colnames(dmat)
+  ## add clust to each query cell
+  tmpmat <- as.data.frame(tmpmat)
+  tmpmat$celltype <- annot_list[row.names(tmpmat)]
+  
+  ## collapse all query cells into clust as well
+  if(collapse_query){
+  
+  outmat <- tmpmat %>% group_by(celltype) %>%
+  summarise(across(everything(), ~ sum(., na.rm=T)))
+  rnames <- outmat$celltype # make rownames the cell type 
+  outmat <- as.matrix(outmat[,which(colnames(outmat) !='celltype')]) # remove celltype column
+  row.names(outmat) <- rnames
+  outmat <- outmat[colnames(outmat),] # make rownames and colnames the same order
+  } else {
+  outmat <- tmpmat
+  }
+  
+  ## return the final dataframe
+  return(outmat)
+  
+  }
+
+```
+
+#### Get hypergeo parameters
+
+Going to use a hypergeometric distribution of edges ab, where a = celltype 1 (ct1), b = celltype2 (ct2), and:
+* x = observed number of times ab is seen in the data
+* m = total number of possible edges that include ab
+    * if a != b: m = (Na * Nb)
+    * if a == b: m = choose(Na,2)
+* n = total number of possible edges that DON'T include ab: [ (((Nt*Nt)-Nt)/2) - m ] (cells can't be their own edge; draw a dummy matrix to make sense of this formula)
+* k = number of edges in the dataset
+
+Note that it's ok to add these values together across cells from the same "group"
+
+```{r}
+# Define function
+adj_mat_to_hypergeo_params <- function(
+    # adjacency matrix
+    outmat,   
+    # named vector of number of cells of each type in the dataset. Names must match adjacency matrix column and row names               
+    nctypes)
+  { 
+
+    # ensure that all cell types are found in each of
+    ## rownames outmat
+    ## colnames outmat
+    ## names of nctype
+    if(any(row.names(outmat) != colnames(outmat))) {
+      stop("Row names and column names of outmat do not match.")
+    }
+      
+    if(!(all(row.names(outmat) %in% names(nctypes)) & all(names(nctypes) %in% row.names(outmat)))) {
+      stop("Row names of outmat and names of nctype do not match.")
+    }
+    
+  
+    ## create output dataframe:
+    ### determine unique combinations of cell types
+    #### sort nctypes first to make sure that the combinations are made correctly
+    out <- as.data.frame(combinations(n = length(names(nctypes)),
+                                        r = 2,
+                                        v = sort(names(nctypes)),
+                                        repeats.allowed = T))
+    colnames(out) <- c('ct1', 'ct2')
+  
+    ## calc total number of each cell type in dataset
+    nt_cell <- sum(nctypes)
+    nt_edge <- sum(outmat)/2
+    
+    ## for each cell in the adjacency matrix, define parameters of hypergeometric distribution
+    ## if output = 'hyper_fit', then determine p values and expected number of edges given the params
+    
+    params <- t(apply(out, 1, function(r) {
+        
+        ### define ct1 and ct2
+        ct1 = unlist(r['ct1'])
+        ct2 = unlist(r['ct2'])
+      
+        ### define parameters of hypergeometric distribution
+        x <- outmat[ct2, ct1]
+        if(ct1==ct2) {
+              m <- choose(nctypes[ct1], 2)} else {
+              m <- nctypes[ct1] * nctypes[ct2]}
+        n <- ((nt_cell * nt_cell) - nt_cell)/2 - m
+        k <- nt_edge
+        
+        ### return parameters
+        return(c(m, n, k, x))
+          
+        }))
+    
+    out <- cbind(out, params)
+    colnames(out) <- c('ct1', 'ct2', 'm', 'n', 'k', 'x')   
+    return(out)  
+    }
+    
+```
+
+#### Fit hypergeo parameters
+This function fits the data to a hypergeometric distribution and calculates fold increased interactions over expected
+
+```{r}
+# Define function
+fit_hyper_geo <- function(
+    # the number of observed interactions between two cell ty pes
+    observed_edge_n,   
+    # the expected hyperparameters for those two cell types
+    expec_hyperparams
+    ){ 
+  
+  
+  ## calc the expected number of edges
+  expec <-  n*K/N
+  
+  ## calc the fold increase of observed / expected
+  foldincr <- observed_edge_n / expec
+  
+  ## calc the p value 
+  pval <- phyper(q=x,
+                 m=m,
+                 k=k,
+                 n=n,
+                 lower.tail = T,
+                 log.p = T)
+          
+  ## return the data
+  out = list(expec, foldincr, pval)
+  names(out) = c('null.expec.edges', 'fold.incr.over.null', 'p.val')
+  return(out)
+}
+  
+```
+
+
+
+```{r}
+genemods_mle_findmarkers <- function(seurat_obj, # Seurat object
+                                     rawdata = NULL, # sparse counts matrix, rows = genes, columns = cells
+                                     mle_negm, # vector of mean negprobe counts per cell, see "insitutype" function
+                                     mle_cohort, # dataframe of parameters used for fastCohorting, see "insitutype" function
+                                     mle_nclust = NULL, # vector of length 2 specifying the minimum and maximum number of clusters for MLE cell to generate
+                                     logfc_min = 0.5 # minimum log2fc required for genes to be designated as marker genes of a subcluster
+                                     ) {
+  
+  
+  # define raw data if undefined
+  if(is.null(rawdata)) {
+    rawdata <- seurat_obj@assays$nanostrRNA@counts
+  }
+  
+  
+  # define nclust if undefined
+  if(is.null(mle_nclust)) {
+    mle_nclust <- c(2, 
+  ## the maximum number of clusters should either be the lesser of: (a) the number of genes or (b) the number of cells / 10, assuming that clusters on average should have at least 10 cells
+                    min(c(nrow(raw), round(ncol(raw)/10))))
+  }
+  
+  
+  # Perform unsupervised cell clustering
+    ## Cohort cells
+    mle_coho <- fastCohorting(mat = mle_cohort,
+                              gaussian_transform = TRUE)
+    
+    
+    ## Cluster cells
+    mle_unsup <- insitutype(counts = t(as.matrix(rawdata)),
+                            neg = mle_ngem,
+                            cohort = mle_coho,
+                            n_clusts = mle_nclust,
+                            reference_profiles = NULL) # NULL value runs unsupervised clustering
+    
+    
+    ## Plot clusters
+    mle_hm <- heatmap(sweep(mle_unsup$profiles,
+                            1,
+                            pmax(apply(mle_unsup$profiles, 1, max),
+                                 .2),
+                            "/"),
+                      scale = "none",
+                      main = "Subcluster Mean Expression Profiles")
+    
+    
+    ## Add cluster data to Seurat object
+    seurat_obj <- AddMetaData(seurat_obj, 
+                              data.frame(mle_unsup$clust))
+  
+  
+  # Run Marker Gene analysis
+  Idents(object = seurat_obj) <- seurat_obj@meta.data$'mle_subclust' 
+
+  mle_subclust_markers <- FindAllMarkers(seurat_obj,
+                                         only.pos = TRUE,
+                                         min.pct = 0.25)
+  
+
+  # Output
+  out <- list()
+  out$cell_cluster_heatmap <- mle_hm
+  
+  return(out)
+  
+}
+
+ 
+```
+
+
+## Load data
+```{r Load data}
+set.seed(0)
+load("processed_data/cleaneddata.RData") # scRNAseq data
+load("processed_data/cannot with distances from gloms.RData") # glomerular distance information from Patrick
+context <- readRDS('processed_data/context4.RDS')
+names(context) <- colnames(raw)
+contam <- readRDS('processed_data/toomuchcontam.RDS') # gene contamination calls by Patrick
+
+```
+
+# Pre-process data
+
+To remove genes that are "expressed" in cells due to poor segmentation, I will use Patrick's contamination dataset: "contaminating transcripts from imperfect cell segmentation – e.g. if a B-cell is surrounded by PCT cells, then when we occasionally draw a cell boundary wrong we’ll place some PCT transcripts in a B-cell. So if any of your clusters are driven by genes typical of another cell type, suspect an artifact. 
+For each cell type x gene, the attached matrix measures how much the gene comes from the appropriate cell type vs. from contamination – higher values mean more pure / less contaminated data. You can use this to check if any of your B-cell cluster marker genes are contaminants. For differential expression, I’m only considering genes with values above 0.2."
+
+Will use cotamstat.RDS to look at the contamination rates from the gene. We can look at each statistically significant gene 
+
+## Define cell types and filter genes
+Distribution of gene contamination scores
+```{r Define Cell Types}
+
+cd4_tcell_types <- c( "T CD4 memory",
+                      "T CD4 naive",
+                      "Treg")
+
+cd8_tcell_types <- c( "T CD8 memory",
+                      "T CD8 naive")
+
+glomcell_types <- c("Podocyte",
+                    "Glomerular.endothelium",
+                    "Mesangial.cell",
+                    "Parietal.epithelium")
+
+vesslcell_types <- c("Vascular.pericyte",
+                     "Peritubular.capillary.endothelium.1",
+                     "Peritubular.capillary.endothelium.2",
+                     "Ascending.vasa.recta.endothelium",
+                     "Descending.vasa.recta.endothelium")
+
+tubcell_types <- c("Connecting.tubule",
+                   "PCT",
+                   "Principal.cell",
+                   "Type.A.intercalated.cell",
+                   "Type.B.intercalated.cell",
+                   "Pelvic.epithelium",
+                   "Thick.ascending.limb.of.Loop.of.Henle",
+                   "Indistinct.intercalated.cell",
+                   "Transitional.urothelium",
+                   "Epithelial.progenitor.cell")
+
+innate_lymph <- c("NK")
+
+interstcell_types <- c("Myofibroblast",
+                       "Fibroblast")
+
+# Define cell types
+all_cell_types <- levels(as.factor(clust))
+
+imm_cell_types <- c("B-cell",
+                    "macrophage",
+                    "mast",
+                    "mDC",
+                    "monocyte",
+                    "neutrophil",
+                    "NK",
+                    "pDC",
+                    "plasmablast",
+                    "T CD4 memory",
+                    "T CD4 naive",
+                    "T CD8 memory",
+                    "T CD8 naive",
+                    "Treg")
+
+b_cell_types <- c("B-cell",
+                  "plasmablast")
+
+my_cell_types <- c("macrophage",
+                        "mast",
+                        "mDC",
+                        "monocyte",
+                        "neutrophil",
+                        "pDC")
+
+str_cell_types <- subset(all_cell_types,
+                           !(all_cell_types %in% imm_cell_types) &
+                             (all_cell_types != "NotDet"))
+                    
+
+basic_cats <- function(x) {
+  if(x %in% b_cell_types) { return('bcell') } else {
+    if(x %in% cd4_tcell_types) { return('tcell_cd4') } else {
+    if(x %in% cd8_tcell_types) { return('tcell_cd8') } else {
+      if(x %in% my_cell_types) { return('mycell') } else {
+        if(x %in% glomcell_types) {return('glomcell') } else {
+          if(x %in% vesslcell_types) {return('vesslcell')} else {
+            if(x %in% tubcell_types) {return('tubcell')} else {
+              if(x %in% interstcell_types) {return('interstcell')} else {
+                if(x %in% innate_lymph) {return('NKcell')}
+                return("ERROR")
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  }
+}
+
+# organize metadata
+annot <- merge(annot, data.frame(clust), by.x = "cell_ID", by.y = "row.names") 
+# add cell calls
+row.names(annot) <- annot$cell_ID
+# annotate cells with larger cell type bins
+annot$basictype <- sapply(annot$clust, basic_cats)
+annot$alpha <- sapply(annot$basictype, function(x) {
+  if(x %in% c('tcell', 'bcell', 'mycell')) {return(1)} else
+    {return(0.2)}
+})
+# refine annotation of cd4 and cd8 t cells, to combine cells together
+subset_tmp <- which(annot$basictype %in% c('tcell_cd4', 'tcell_cd8'))
+annot[subset_tmp,'clust'] <- annot[subset_tmp,'basictype']
+
+
+tmp <- as.data.frame(contam[,c(b_cell_types)])
+tmp$maxval <- unlist(apply(tmp, 1, max))
+
+ggplot(tmp, aes(x = maxval)) + geom_density()
+
+```
+
+```{r Filter genes}
+
+# Define contaminated genes for B cells
+b_cell_uncontam <- row.names(
+  data.frame(!(contam[,b_cell_types])) %>% 
+    filter_all(all_vars(.))
+)
+
+
+```
+
+
+
+## Compute PCA and generate UMAP
+Will use Seurat to obtain UMAP to cluster cells
+
+```{r}
+# Creat Seurat Object
+## prepare all annotations
+annot$context <- context[annot$cell_ID]
+annot <- bind_cols(annot, cannot[annot$cell_ID,c('in.glom', 'inside.glom','position.vs.glom', 'closest.glom')])
+## B-cells
+bcell_seurat <- CreateSeuratObject(
+  counts = raw[c(b_cell_uncontam, 'HBB'),],
+  project = "LN_spatial",
+  assay = "nanostrRNA",
+  meta.data = annot
+)
+
+### only B-cell annotation
+bcell_seurat <- subset(bcell_seurat,
+                       subset = clust %in% b_cell_types)
+
+# Scale data
+bcell_seurat@meta.data$log10totalcounts <- sapply(bcell_seurat@meta.data$nCount_nanostrRNA, log10)
+bcell_seurat <- ScaleData(bcell_seurat, 
+                          features = c(b_cell_uncontam, 'HBB'),
+                          model.use = 'negbinom',
+                          vars.to.regress = 'log10totalcounts')
+
+## negative values in the Scale Data column correspond to 0 values in the expression data. Rather than let pseudocounts cause "negative gene expression", these values should be corrected to be zero
+tru_val <- as.vector(bcell_seurat@assays$nanostrRNA@counts)
+scaled <- as.vector(bcell_seurat@assays$nanostrRNA@scale.data)
+toplot <- data.frame(counts = tru_val,
+                     scaled = scaled)
+
+ggplot(toplot, aes(x = counts, y = scaled)) + geom_point(alpha = 0.2, size = 0.2)
+
+# Make all scaled values < 0 equal 0 
+bcell_seurat@assays$nanostrRNA@scale.data[which(bcell_seurat@assays$nanostrRNA@scale.data < 0)] <- 0
+
+# Filter HBB+ cells
+## Dist
+cells_in_data <- colnames(bcell_seurat)
+
+tmp <- data.frame(cell_ID = cells_in_data,
+                  HBB = bcell_seurat@assays$nanostrRNA@scale.data['HBB', cells_in_data],
+                  HBA = bcell_seurat@assays$nanostrRNA@scale.data['HBA1', cells_in_data])
+
+ggplot(tmp, aes(x = HBA, y = HBB)) + geom_point()
+
+HB_cells <- tmp[which((tmp$HBA > 2.5) |
+                        tmp$HBB > 2.5), 'cell_ID']
+nonHB_cells <- tmp$cell_ID[which(!(tmp$cell_ID %in% HB_cells))]
+
+### update annot to include rbcs
+annot[which(annot$cell_ID %in% HB_cells),'basictype'] <- 'rbc'
+annot[which(annot$cell_ID %in% HB_cells),'clust'] <- 'rbc'
+
+### No HB cells
+bcell_seurat <- subset(bcell_seurat,
+                       subset = cell_ID %in% nonHB_cells)
+
+### No hemoglobin gene expression
+all_genes <- row.names(bcell_seurat)
+bcell_seurat <- subset(bcell_seurat,
+                       features = all_genes[which(!(all_genes %in% c('HBB', 'HBA1')))])
+bcell_all.genes <- rownames(bcell_seurat)
+
+# Run PCA
+## B-cells
+bcell_seurat <- RunPCA(bcell_seurat, features = bcell_all.genes, npcs=20)
+ElbowPlot(bcell_seurat, ndims=20)
+bcell_seurat <- RunUMAP(bcell_seurat, dims = 1:20)
+
+# Run UMAP
+## B-cells
+bcell_seurat <- FindNeighbors(bcell_seurat, dims = 1:20)
+bcell_seurat <- FindClusters(bcell_seurat, resolution = 1)
+bcell_seurat <- AddMetaData(bcell_seurat,
+                  data.frame(bcell_seurat@reductions$umap@cell.embeddings))
+
+DimPlot(bcell_seurat, reduction = 'umap') + plot_annotation(title='B-cell PCA Clusters')
+ggplot(bcell_seurat@meta.data,
+       aes(x=UMAP_1, 
+           y=UMAP_2,
+           color=log10totalcounts)) +
+  geom_point(size=0.5) +
+  ggtitle('B-cell UMAP with RNA Counts')
+  
+
+```
+
+# Subcluster cells with MLE
+## Use MLEcell
+
+```{r Subcluster cells, message=FALSE}
+# b cell subclustering
+bcell_cols <- which(clust %in% b_cell_types)
+bcell_cnts <- raw[b_cell_uncontam,bcell_cols]
+bcell_negm <- annot[bcell_cols,'negmean']
+bcell_coho <- fastCohorting(annot[bcell_cols, c('Area',
+                                                'AspectRatio',
+                                                'Mean.PanCK', 
+                                                'Mean.CD45',
+                                                'Mean.DAPI')],
+                        gaussian_transform = TRUE) 
+
+bcell_unsup <- insitutype(counts = t(as.matrix(bcell_cnts)),
+                          neg = bcell_negm,
+                          cohort = bcell_coho,
+                          bg = NULL, 
+                    n_clusts = c(2, 4),
+                    reference_profiles = NULL, # NULL value runs unsupervised clustering
+                    ) 
+```
+
+## MLE heatmap
+
+```{r Heatmaps of Original Clustering}
+# B-cell heatmap
+str(bcell_unsup)
+round(head(bcell_unsup$prob),2)
+
+bcell_hm <- heatmap(sweep(bcell_unsup$profiles,
+                          1,
+                          pmax(apply(bcell_unsup$profiles, 1, max),
+                               .2),
+                          "/"),
+                    scale = "none",
+                    main = "B-cell Subcluster Mean Expression Profiles")
+
+```
+## Flightpath plot
+
+```{r Flightpath Plots}
+## B-cells
+# define cluster colors:
+cols <- c('#a6cee3','#1f78b4','#b2df8a','#33a02c')
+cols <- cols[seq_along(unique(bcell_unsup$clust))]
+names(cols) <- unique(bcell_unsup$clust)
+
+# make the flightpath plot
+fp <- flightpath_plot(flightpath_result = NULL, insitutype_result = bcell_unsup, col = cols[bcell_unsup$clust])
+class(fp)
+print(fp)
+ggsave(fp, file="figures/bcell_MLEcell_fp.png")
+
+```
+
+
+## Compare MLEcell and UMAP
+
+```{r MLEcell Subclusters on UMAP}
+# B-cells
+bcell_seurat <- AddMetaData(bcell_seurat, 
+                            data.frame(bcell_unsup$clust))
+
+# rename subcluster identity
+new = c('B.4','B.1','B.3','B.2')
+new = factor(new, levels = c('B.1', 'B.2', 'B.3', 'B.4'))
+key = data.frame(old = letters[1:4],
+                 new = new)
+
+bcell_seurat@meta.data$bcell_subclust <- sapply(bcell_seurat@meta.data$bcell_unsup.clust,
+                                                function(o) {
+                                                  return(key[which(key$old == o),'new'])
+                                                })
+
+bcell_seurat@meta.data$bcell_subclust <- factor(bcell_seurat@meta.data$bcell_subclust)
+
+bcellcols <- c('#66c2a5','#fc8d62','#8da0cb','#e78ac3')
+
+ggplot(bcell_seurat@meta.data,
+       aes(x=UMAP_1,y=UMAP_2,color=bcell_subclust)) +
+  geom_point(size=1) +
+  scale_color_manual(values = bcellcols)
+
+ggsave('figures/bcell_MLEcell_subclusts_UMAPspace.png',
+       height=5.5)
+
+saveRDS(bcell_seurat, 
+        file = 'processed_data/bcell_seurat.RDS')
+```
+
+## Pub UMAP plot 
+
+### Determine reasonable count filter
+
+```{r}
+lapply(seq(from = 1.5, to = 2.5, by =0.1), function(x) {
+  print(x)
+  
+  # filter and rescale the data
+  temp_seurat <- ScaleData(subset(bcell_seurat, subset = log10totalcounts > x), 
+                          features = c(bcell_all.genes),
+                          model.use = 'negbinom',
+                          vars.to.regress = 'log10totalcounts')
+  # Run PCA
+  temp_seurat <- RunPCA(temp_seurat, features = bcell_all.genes, npcs=20)
+  # Run UMAP
+  temp_seurat <- RunUMAP(temp_seurat, dims = 1:20)
+  # Plot
+  Idents(object = temp_seurat) <- temp_seurat@meta.data$'bcell_unsup.clust' 
+  DimPlot(temp_seurat,
+          reduction = 'umap',
+          ) + plot_annotation(title=paste0('B-cell Subclusters, log RNA count >', x))
+})
+
+```
+
+cells with > 80 RNA counts seem to do best
+
+### Plot UMAP
+
+```{r}
+#filter by ncounts
+bcell_seurat_fil <- subset(bcell_seurat, subset = log10totalcounts > 1.9)
+
+#run UMAP
+bcell_seurat_fil <- RunPCA(bcell_seurat_fil, features = bcell_all.genes, npcs=20)
+bcell_seurat_fil <- RunUMAP(bcell_seurat_fil, dims = 1:20)
+Idents(object = bcell_seurat_fil) <- bcell_seurat_fil@meta.data$'bcell_subclust' 
+
+# remove old UMAP cols from metadata
+bcell_seurat_fil@meta.data <- bcell_seurat_fil@meta.data[,which(!(colnames(bcell_seurat_fil@meta.data) %in% c('UMAP_1', 'UMAP_2')))]
+
+# Add new UMAP cols
+bcell_seurat_fil <- AddMetaData(bcell_seurat_fil,
+                  data.frame(bcell_seurat_fil@reductions$umap@cell.embeddings))
+
+
+# Make sure it's not too batchy
+ggplot(bcell_seurat_fil@meta.data,
+       aes(x=UMAP_1, 
+           y=UMAP_2,
+           color=tissuename)) +
+  geom_point(size=1) +
+  facet_wrap(~tissuename) +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank())
+
+# Plot
+ggplot(bcell_seurat_fil@meta.data,
+       aes(x=UMAP_1, 
+           y=UMAP_2,
+           color=bcell_subclust)) +
+  geom_point(size=1) +
+  scale_color_manual(values = bcellcols,
+                    guide = guide_legend(title = "B-cell\nsubcluster",
+                                         keyheight = 0.5,
+                                         keywidth = 0.5)) +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank())
+
+ggsave(file = 'figures/bcellsubclust_UMAP.svg',
+       width = 4,
+       height = 3,
+       device = svg)
+
+
+# Plot plasmablast and B-cell identity
+ggplot(bcell_seurat_fil@meta.data,
+       aes(x=UMAP_1, 
+           y=UMAP_2,
+           color=clust)) +
+  geom_point(size=1) +
+  scale_color_manual(values = bcellcols,
+                    guide = guide_legend(title = "Patrick\ncell types",
+                                         keyheight = 0.5,
+                                         keywidth = 0.5)) +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank())
+
+ggsave(file = 'figures/bcellPlasma_UMAP.svg',
+       width = 4,
+       height = 3,
+       device = svg)
+
+
+```
+
+# Subcluster vs other variables
+
+## Continuous variables
+
+```{r Assess Continuous Variables, message=FALSE}
+## define continuous variables
+contvars <- list("totalcounts", "Area", "Mean.PanCK", "Max.PanCK", "Mean.CD45", "Max.CD45", "Mean.DAPI", "Max.DAPI")
+
+
+## B-cells
+# MLE-cell vs continuous variables
+plts <- lapply(contvars, function(d) {
+  ggplot(bcell_seurat@meta.data,
+         aes_string(x = "bcell_subclust",
+                    y = d)) + geom_violin() +
+    geom_jitter(size = 0.5, alpha = 0.1) +
+    scale_y_continuous(trans='log10')
+  
+})
+
+plts <- ggarrange(plotlist=plts, labels = contvars, common.legend = F)
+ggsave(filename = 'figures/bcell_MLEcellsubclusts_contvar_metadats.png',
+       plts,
+       width = 20,
+       height = 14)
+```
+
+
+## Discrete variables
+
+```{r Assess Discrete Variables, message=FALSE}
+## Define discrete variables
+discvars <- list("tissuename", "class", "clust", 'context', 'position.vs.glom')
+
+## B-cells
+plts <- lapply(discvars, function(d) {
+  ggplot(bcell_seurat@meta.data,
+         aes_string(x = "bcell_subclust", fill = d)) +
+    geom_bar()
+  
+})
+
+plts <- ggarrange(plotlist=plts,
+                  labels = discvars, 
+                  common.legend = F)
+
+ggsave(filename = 'figures/bcell_MLEcell_discvar_metadats.png',
+       plts,
+       width = 20,
+       height = 15)
+```
+
+
+## Lupus class
+
+```{r Look at Lupus Class, message=FALSE}
+# B-cells
+## look at over-representation of clusters in each class
+bcell_unsup_lupusclass_chisq <- chisq.test(table(bcell_seurat@meta.data$class,
+                                                 bcell_seurat@meta.data$bcell_subclust))
+bcell_unsup_lupusclass_chisq_res <- melt(bcell_unsup_lupusclass_chisq$residuals)
+colnames(bcell_unsup_lupusclass_chisq_res) <- c('class',
+                                                'cluster',
+                                                'residual')
+
+bcell_unsup_lupusclass_chisq_res %>% 
+  arrange(plyr::desc(residual))
+
+## most over-represented cell subset in each cluster, along with residual
+bcell_unsup_class_overrep <- bcell_unsup_lupusclass_chisq_res %>%
+  group_by(cluster) %>%
+  slice_max(n=1, order_by=residual) %>%
+  summarize(cluster=cluster, class=class, max_residual=residual, )
+
+## plot class vs cluster with underlying plot of the class most over-represented and its chi-sq residual
+## Most interesting are c, e, h, m, and t (residuals > 5)
+ggplot() +
+  geom_bar(data=bcell_seurat@meta.data,
+           color="black",
+           aes(x=bcell_subclust,
+               fill=class)) +
+  geom_point(data=bcell_unsup_class_overrep,
+             color="black",
+             shape=21,
+             aes(x=cluster,
+                 y=-30,
+                 fill=class,
+                 size=max_residual)) +
+  labs(title = 'B-cell Subcluster Prevalence across Lupus Nephritis Classes') +
+  ylab('Number of cells') +
+  xlab('B-cell subluster ID') +
+  guides(fill=guide_legend(title="LN Class"),
+         size=guide_legend(title='ChiSq Residual'))
+
+ggsave('figures/bcell_subclusterIDvsLNClass.png')
+
+
+# ok, screw that. Let's do a diseased vs undiseased test first instead
+bcell_seurat@meta.data$disease = 'LN'
+bcell_seurat@meta.data[which(bcell_seurat@meta.data$class == 'control'),'disease'] <- 'Control'
+
+bcell_subclust_chisq_dz <- bind_rows(lapply(new, function(cl) {
+  print(cl)
+  df <- bcell_seurat@meta.data
+  df$cl <- cl
+  df$cl <- as.character(df$cl)
+  df[which(df$bcell_subclust != cl),'cl'] <- 'other clusters'
+  chisq <- chisq.test(table(df$disease, df$cl))
+  return(cbind(data.frame(subcluster = cl), broom::tidy(chisq)))
+  
+  
+}))
+
+bcell_subclust_chisq_dz$p.value.adj = p.adjust(bcell_subclust_chisq_dz$p.value,
+                                               method = 'BH')
+
+fig <- ggplot() +
+  geom_bar(data = bcell_seurat@meta.data,
+           aes(y = disease,
+               fill = bcell_subclust),
+           position = 'fill',
+           color = 'black') +
+  geom_point(data = data.frame(x=c(0.15, 0.69),
+                               y=c('control','sle')),
+             aes(x=x,y=y),
+             shape=8) +
+  scale_fill_manual(values = bcellcols,
+                    guide = guide_legend(title = "B-cell\nsubcluster",
+                                         keyheight = 0.5,
+                                         keywidth = 0.5)) +
+  scale_x_continuous(labels = scales::percent) +
+  ylab(label = element_blank()) +
+  xlab(label = element_blank())
+
+
+ggsave(filename = 'figures/bcell_subclust_lupusclass.svg',
+       plot = fig,
+       width = 3,
+       height = 1,
+       units = "in",
+       device = svg)
+
+bcell_subclust_chisq_dz
+
+```
+
+
+## Tubulointerstitial hotspots
+```{r}
+context <- readRDS('processed_data/context4.RDS')
+context <- annot[,c('cell_ID', 'context')]
+#bcell_seurat@meta.data <- merge(bcell_seurat@meta.data, context, by = 'cell_ID')
+
+df <- melt(table(bcell_seurat@meta.data[,#which(bcell_seurat@meta.data$disease == 'LN'),
+                             c('context', 'bcell_subclust', 'disease')]))
+
+# Get the percentage of B.3 cells in hotspots, and overall
+all_cell_perc <- df %>% group_by(bcell_subclust) %>% summarize(sum(value)/sum(df$value))
+hotspot_perc <- subset(df, context == 'hotspot') %>% group_by(bcell_subclust) %>% summarize(sum(value) / sum(df[which(df$context == 'hotspot'),'value']))
+
+# perform a chisq
+chisqtable <- table(data.frame(
+  B.3 = sapply(bcell_seurat@meta.data$bcell_subclust, function(c) {c=='B.3'}),
+  hotspot = sapply(bcell_seurat@meta.data$context, function(c) {c=='hotspot'})))
+chisq.test(chisqtable,
+              )
+
+fig <- ggplot() +
+  geom_bar(data = bcell_seurat@meta.data,
+           aes(y = bcell_subclust,
+               fill = context),
+           position = 'fill',
+           color = 'black') +
+  scale_fill_manual(values = c('#80b1d3', '#fb8072', '#bebada', '#fdb462')) +
+  scale_x_continuous(labels = scales::percent) +
+  ylab(label = 'B-cell\nSubcluster') +
+  xlab(label = element_blank()) +
+  labs(fill = "Location") +
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(t = -0.5, unit = "cm"),
+        legend.title = element_text(size = 10)) +
+  guides(fill = guide_legend(title.position = 'top',
+                             nrow = 4))
+
+ggsave(filename = 'figures/bcell_subclust_hotspots.svg',
+       plot = fig,
+       width = 2,
+       height = 2,
+       units = "in",
+       device = svg)
+
+```
+
+
+# Subcluster DEGs
+
+## Identify marker genes
+
+```{r Identify Subcluster Marker Genes, message=FALSE}
+
+# B-cells
+# set identity of cells for finding markers to the clusters discovered with MLEcell
+Idents(object = bcell_seurat) <- bcell_seurat@meta.data$'bcell_subclust' 
+
+bcell_MLE_markers <- FindAllMarkers(bcell_seurat,
+                                    only.pos = TRUE,
+                                    min.pct = 0.25,
+                                    logfc.threshold = 0.25)
+
+bcell_MLE_markers <-  merge(bcell_MLE_markers, 
+                                data.frame(contam[,c("B-cell", "plasmablast")]), 
+                            by.x = 'gene',
+                            by.y = 'row.names',
+                            all.x=T)
+
+# Retrive top statistically significant markers
+bcell_MLE_markers_top5 <- bcell_MLE_markers %>%
+  filter(p_val_adj < 0.01) %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+
+# Plot the cluster and the top three markers on UMAP, with an additional label showing the top 5 genes with genes affected by contamination in RED
+for(cl in unique(bcell_MLE_markers_top5$cluster)) {
+  
+  df <- bcell_MLE_markers_top5 %>%
+    filter(cluster == cl) %>%
+    arrange(desc(avg_log2FC))
+
+  plts <-lapply(df$gene, function(x) {
+    FeaturePlot(bcell_seurat_fil, x, max.cutoff="q99", pt.size=0.2) + ggtitle(x)
+  })
+  
+  dat <- bcell_seurat_fil@meta.data
+  dat$alp_cluster <- sapply(dat$bcell_subclust,
+                            function(x){
+                              if(x==cl){
+                                return(1)} else {
+                                  return(0.2)
+                              }})
+  col_ref_table <- data.frame(bcell_subclust = new,
+                              clust_color = bcellcols[1:length(new)])
+  col_ref_table$clust_color <- apply(col_ref_table,
+                                     1,
+                                     function(x){
+                                        if(x[1]==cl) {
+                                          return(x[2])
+                                        } else {
+                                          return('#9E9E9E')
+                                        }
+                                      })
+                              
+  
+  p4 <- ggplot(dat,
+               aes(x=UMAP_1,
+                   y=UMAP_2,
+                color=bcell_subclust,
+                alpha=alp_cluster)) +
+  geom_point(size=0.2) +
+  scale_color_manual(values=col_ref_table$clust_color) +
+  theme(legend.position="none",
+        plot.margin= margin(0.5,6,0.5,0.5,unit='cm'))
+  
+  
+  df$pval_adj <- sapply(df$p_val_adj, function(x) sprintf("%.2e", x))
+  df$log2FC <- sapply(df$avg_log2FC, function(x) round(x, digits = 2))
+    
+  p5 <- gridExtra::tableGrob(df[,c('gene',
+                                   'p_val_adj',
+                                   'log2FC',
+                                   'pct.1',
+                                   'pct.2'
+                                   )])
+  
+  
+  if(length(plts)==1) {G1 <- (plts[[1]] | plot_spacer() | plot_spacer()) / (p4|p5|plot_spacer()) } else 
+    if(length(plts)==2) {G1 <- (plts[[1]] | plts[[2]] | plot_spacer()) / (p4|p5|plot_spacer()) } else
+      {G1 <- (plts[[1]] | plts[[2]] | plts[[3]]) / (p4|p5|plot_spacer()) }
+  
+  ggsave(paste0('figures/bcell_subclust_',cl,'_markergenes.png',
+                                  sep=""),
+         G1,
+         width=10,
+         height=5,
+         units='in')
+}
+
+write.csv(bcell_MLE_markers, paste0('bcell_MLE_markers.csv'))
+
+```
+
+
+## DEGs of interest
+
+```{r}
+goi <- c('IGHM', 'IGHA1', 'IGHG1', 'XBP1', 'HLA-DQA1', 'HLA-DPA1')
+
+# Make a list of feature plots
+figs <- lapply(goi, function(g) {
+  FeaturePlot(bcell_seurat_fil,
+                   features = g,
+              pt.size = 0.1,
+              max.cutoff = 'q95') + 
+    ## add my theme
+    my_theme +
+    ## make it publication ready
+    theme(
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      plot.title = element_text(face = "italic",
+                                size = 10),
+      axis.ticks = element_blank(),
+      legend.position = "none"
+)})
+
+# Put feature plots together
+faceted_plot <- wrap_plots(plotlist = figs,
+                           ncol = 2)
+
+# Plot it
+ggsave(filename = 'figures/bcell_subclust_goi.svg',
+       plot = faceted_plot,
+       width = 2.5,
+       height = 4,
+       units = "in",
+       device = svg)
+
+
+
+
+```
+
+# Lupus vs control analyses
+
+## Number of cells
+
+```{r}
+df <- bcell_seurat@meta.data %>%
+  filter(!tissue %in% c("SP20_1098", "SP20_10838")) %>%
+  group_by(tissue, disease) %>%
+  summarize(number_bcells = n())
+
+wilcox.test(unlist(df[which(df$disease == 'Control'), 'number_bcells']),
+            unlist(df[which(df$disease == 'LN'), 'number_bcells']),
+            alternative = 'less')
+
+
+ggplot(df,
+       aes(x = disease,
+           y = number_bcells,
+           fill = disease)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  scale_fill_manual(values = c('#0571b0', '#ca0020')) +
+  ylab('Number of B-cells') +
+  xlab(label = element_blank()) +
+  theme(legend.position='none')
+
+ggsave(file = 'figures/lupuscontrols_numbcells.svg',
+       width = 1.5,
+       height = 1.5,
+       device = svg)
+
+
+```
+
+## Number of each subcluster
+```{r}
+df <- bcell_seurat@meta.data %>%
+  filter(!tissue %in% c("SP20_1098", "SP20_10838")) %>%
+  group_by(tissue, disease, bcell_subclust) %>%
+  summarize(number_cells = n())
+
+lapply(unique(df$bcell_subclust), function(cl) {
+  df <- df[which(df$bcell_subclust == cl),]
+  wilcox.test(unlist(df[which(df$disease == 'Control'), 'number_cells']),
+            unlist(df[which(df$disease == 'LN'), 'number_cells']))
+})
+
+ggplot(df,
+       aes(x = disease,
+           y = number_cells,
+           fill = disease)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15) +
+  scale_fill_manual(values = c('#0571b0', '#ca0020')) +
+  facet_wrap(~bcell_subclust) +
+  ylab('Number of B-cells') +
+  xlab(label = element_blank()) +
+  theme(legend.position='none')
+
+ggsave(file = 'figures/lupuscontrols_numbcells_subclust.svg',
+       width = 3.5,
+       height = 3.5,
+       device = svg)
+
+
+```
+
+
+## Proportion of each subcluster
+
+```{r}
+bcell_seurat@meta.data <- bcell_seurat@meta.data[,which(
+  !(duplicated(colnames(bcell_seurat@meta.data)))
+)]
+
+df <- bcell_seurat@meta.data %>%
+  filter(!tissue %in% c("SP20_1098", "SP20_10838")) %>%
+  group_by(tissue, disease, bcell_unsup.clust) %>%
+  summarize(number_cells = n()) %>%
+  mutate(freq = number_cells/sum(number_cells))
+
+
+wilcox.test(unlist(df[which(df$disease == 'Control'), 'number_cells']),
+            unlist(df[which(df$disease == 'LN'), 'number_cells']))
+
+ggplot() +
+  geom_bar(data = bcell_seurat@meta.data,
+           aes(x = disease,
+               fill = bcell_subclust),
+           position = 'fill',
+           color = 'black') +
+  geom_point(data = data.frame(y=c(0.15, 0.70),
+                               x=c('Control', 'LN')),
+             aes(x=x,y=y),
+             shape=8) +
+  scale_fill_manual(values = bcellcols,
+                    guide = guide_legend(title = "B-cell\nsubcluster",
+                                         keyheight = 0.5,
+                                         keywidth = 0.5)) +
+  scale_y_continuous(labels = scales::percent) +
+  ylab(label = element_blank()) +
+  xlab(label = element_blank())
+  
+
+ggsave(file = 'figures/lupuscontrols_propsubclusts.svg',
+       width = 2.5,
+       height = 3,
+       device = svg)
+
+```
+
+# Visual analyses
+
+
+## Load data for visual analyses
+ 
+```{r}
+# load data
+xycoords <- customlocs
+row.names(xycoords) <- colnames(raw)
+
+# calculate pairwise distance matrices for all immune cells
+dists <- sapply(unique(annot$tissue), function(tis) { 
+  
+  cells = filter(annot, (tissue == tis &
+                           !(cell_ID %in% HB_cells) & # remove hemoglobin+ cells from immune cells
+                        basictype %in% c('tcell_cd4',
+                                         'tcell_cd8',
+                                         'bcell',
+                                         'mycell'))) %>% dplyr::select(cell_ID) %>% unlist
+  return(dist(xycoords[cells,]))
+  
+  })
+
+
+
+```
+
+
+## Number of cells within 50 cells
+
+TO perform this analysis, each tissue must be assessed independently to prevent too muchy memory from being used.
+
+```{r}
+# define function that retrieves the 50 closest cells for a given set of "cells of interest"
+find_closest_cells <- function(distance_matrix,
+                               num_closest_cells,
+                               cois = subset(annot, basictype == 'bcell')$cell_ID) { 
+  
+  ## filter for B cells only
+  distance_matrix <- sapply(cois, 
+                function(c) {
+                  usedist::dist_get(distance_matrix,
+                                    c,
+                                    cells)
+                            })
+  row.names(distance_matrix) <- cells
+                            
+  print(dim(distance_matrix))
+  cell_names <- row.names(distance_matrix)
+  num_cells <- ncol(distance_matrix)
+  closest_cells_list <- vector("list", num_cells)
+  
+  for (i in 1:num_cells) {
+    distances <- distance_matrix[,i]
+    closest_indices <- order(distances)[1:num_closest_cells]
+    
+    closest_cell_names <- cell_names[closest_indices]
+    closest_cells_list[[i]] <- closest_cell_names
+  }
+  
+  names(closest_cells_list) <- colnames(distance_matrix)
+  return(closest_cells_list)
+}
+
+# define function that takes a list of cells and counts the number of immune cells
+count_imm_cells <- function(cell_list) {
+  
+  annot_subset <- subset(annot, basictype %in% (c('bcell',
+                                                  'mycell',
+                                                  'tcell',
+                                                  'NKcell')))
+  return(sum(sapply(cell_list, function(c) {c %in% annot_subset$cell_ID})))
+}
+
+# iterate through each tissue sample to assess the number of immune cells next to each cell
+## initialize empty list
+tissue_ids <- unique(annot$tissue)
+num_tissues <- length(tissue_ids)
+tissue_bcell_nimmune_cells <- vector("list", num_tissues)
+
+## iterate through each tissue's xycords:
+for(i in 1:num_tissues) {
+  print(paste0('Analzying tissue ', tissue_ids[i]))
+  ### compute distance matrix
+  cells = filter(annot, (tissue == tissue_ids[i]))$cell_ID
+  distance_matrix <- dist(xycoords[cells,])
+  
+  ### get 50 closest cells to each B cell (not counting the cell itself..)
+  closest_cells <- find_closest_cells(distance_matrix,
+                                      51,
+                                      subset(annot,
+                                             (basictype == 'bcell' &
+                                               tissue == tissue_ids[i]))$cell_ID)  
+  rm(distance_matrix)
+  gc() # save memory
+  ### count number of immune cells in each list of 50
+  imm_cell_nums <- lapply(closest_cells, count_imm_cells)
+  ### populate the empty list
+  tissue_bcell_nimmune_cells[[i]] <- data.frame(cell_ID = names(closest_cells),
+                                                n_imm_cells = unlist(imm_cell_nums)-1) # remove one from each to remove self
+} 
+
+tissue_bcell_nimmune_cells_df <- bind_rows(tissue_bcell_nimmune_cells)
+
+## plot data, separating controls and SLE patients
+### Prep data
+tissue_bcell_nimmune_cells_df$imm_hotspot <- as.numeric(tissue_bcell_nimmune_cells_df$n_imm_cells > 0)
+tissue_bcell_nimmune_cells_df <- merge(tissue_bcell_nimmune_cells_df, bcell_seurat@meta.data[,c('bcell_subclust', 'disease')], by = 'row.names')
+
+
+tab <- table(tissue_bcell_nimmune_cells_df[which(tissue_bcell_nimmune_cells_df$disease=='LN'),c('bcell_subclust', 'imm_hotspot')])
+tab[,1] / tab[,2]
+
+
+
+### column for whether a cell is in an tubulointerstitial hotspot
+df <- tissue_bcell_nimmune_cells_df
+df$context <- sapply(df$cell_ID, function(ci) {annot[ci,'context']})
+df$tubinst_hotspot <- sapply(df$context, function(c) {c == 'hotspot'})
+
+
+### save df
+write.csv(df, file = "num_imm_wi_50.csv")
+
+### read df
+df <- read.csv("num_imm_wi_50.csv", row.names = 1)
+
+### plot data
+ggplot(df,
+       aes(x = n_imm_cells,
+           fill = as.factor(context))) +
+  geom_histogram(color = 'black') +
+  facet_wrap(disease~ bcell_subclust,
+             scales = 'free_y',
+             nrow = 2) +
+  scale_fill_manual(values = c('#80b1d3', '#fb8072', '#bebada', '#fdb462')) +
+  ylab(label = element_blank()) +
+  xlab(label = 'Number of Nearby Immune Cells') +
+  labs(fill = "Location") +
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(t = 0, unit = "cm"),
+        legend.title = element_text(size = 10))
+
+ggsave(file = 'figures/lupuscontrols_numbimmcells_location_subclust.svg',
+       width = 6,
+       height = 3.5,
+       device = svg)
+
+```
+
+
+
+## Network Analysis
+### Hypergeometric dists clust
+
+```{r}
+# fit hypergeometric parameters for each cell type for each sample
+adj_matrices <- lapply(dists, function(d) { 
+  tmp <- annot[which(annot$cell_ID %in% colnames(as.matrix(d))), c('cell_ID', 'clust')]
+  annot_list <- tmp$clust
+  names(annot_list) <- tmp$cell_ID
+  return(make_adj_mat(d,
+                      annot_list,
+                      0.1))
+  }); names(adj_matrices) <- names(dists)
+
+
+# get parameters for hypergeometric distribution
+adj_matrix_hyperparams <- lapply(seq(1, length(adj_matrices)), function(n) {
+  print(n)
+  ## define the number of cell types within each distance matrix using the annot dataframe
+  ### get the cells from the annotation dataframe
+  nctypes <- table(annot[which(annot$cell_ID %in% colnames(as.matrix(dists[[n]]))), 'clust'])
+  ### reorder the nctypes to be the same as the columns in the dataset
+  nctypes <- nctypes[colnames(adj_matrices[[n]])]
+  out <- adj_mat_to_hypergeo_params(adj_matrices[[n]],
+                       nctypes)
+  out$tissue <- names(dists)[n]
+  return(out)
+}) %>% bind_rows()
+
+# look at the networks control vs lupus cases
+## define control and sle samples
+control_samples <- unique(annot[which(annot$class == 'control'),'tissue'])
+sle_samples <- unique(annot[which(annot$class != 'control'), 'tissue'])
+adj_matrix_hyperparams$disease <- 'control'
+adj_matrix_hyperparams[which(adj_matrix_hyperparams$tissue %in% sle_samples),
+                       'disease'] <- 'sle'
+
+adj_matrix_hyperparams$ct1.2 <- t(apply(adj_matrix_hyperparams[,c('ct1', 'ct2')],
+                                      1,
+                                      function(r) {
+                                        paste(unlist(r), 
+                                              sep = '_')
+                                      }))
+
+## do the following to each set of samples:
+### (1) sum hypergeometric distribution hyperparameters (m, n, k) and observed edges (x)
+### (2) calculate the expected number of edges (expected.edges)
+### (3) calculate the fold increase over expected (fold.incr)
+### (4) calculate a p-value
+
+sle.v.control.clust <- adj_matrix_hyperparams %>% 
+  dplyr::group_by(ct1, ct2, disease) %>%
+  summarise(m = sum(m),
+            n = sum(n),
+            k = sum(k),
+            x = sum(x),
+            expected.edges = max(c(qhyper(p=0.5,
+                                          m = sum(m),
+                                          k = sum(k),
+                                          n = sum(n)),
+                                   0.5)),
+            p.val = max(c(phyper(q=sum(x),
+                                 m=sum(m),
+                                 k=sum(k),
+                                 n=sum(n),
+                                 lower.tail = F,
+                                 log.p = F),
+                          1e-30)))
+
+# add log2FC of observed over expected
+sle.v.control.clust$log2.o.e <- log2(sle.v.control.clust$x/sle.v.control.clust$expected.edges)
+
+## adjust p-value for sle and controls separately
+### sle
+sle <- sle.v.control.clust[which(sle.v.control.clust$disease == 'sle'),]
+sle$p.adj <- p.adjust(sle$p.val,
+                      method = 'BH')
+### control
+ctrl <- sle.v.control.clust[which(sle.v.control.clust$disease == 'control'),]            
+ctrl$p.adj <- p.adjust(ctrl$p.val,
+                      method = 'BH')
+
+
+# plot the results
+## make a key of abbreviated names
+key_df <- t(data.frame(c('B-cell', "Bc"),
+                     c("plasmablast", "PC"),
+                     c("macrophage", "Mφ"),
+                     c("mast", "Mast"),
+                     c("mDC", "mDC"),
+                     c("pDC", "pDC"),
+                     c("monocyte", "Mono"),
+                     c("neutrophil", "Neut"),
+                     c("tcell_cd4", "Tc4"),
+                     c("tcell_cd8", "Tc8"),
+                     c('B.1', 'B.1'),
+                     c('B.2', 'B.2'),
+                     c('B.3', 'B.3'),
+                     c('B.4', 'B.4')))
+key_vector <- key_df[,2]
+names(key_vector) <- key_df[,1]
+
+## make a color coded list
+colors <- c(rep('#8da0cb', 2), rep('#fc8d62', 6), rep('#66c2a5', 2), rep('#8da0cb', 4))
+names(colors) <- key_df[,2]
+
+## apply the key to the sle dataset
+sle$ct1_abr <- sapply(sle$ct1, function(c) {key_vector[c]})
+sle$ct2_abr <- sapply(sle$ct2, function(c) {key_vector[c]})
+
+## sle
+sle.fil.g <- graph_from_data_frame(sle[which(sle$p.adj < 0.01),
+                                                      c('ct1_abr',
+                                                        'ct2_abr',
+                                                        'log2.o.e',
+                                                        'p.adj'
+                                                        )],
+                                   directed = F)
+
+sle.fil.g <- set_vertex_attr(sle.fil.g, "color", value = colors[get.vertex.attribute(sle.fil.g, "name")])
+
+## remove self-interacting nodes
+g <- sle.fil.g
+sle.fil.g_noself <- igraph::simplify(g, remove.loops = TRUE)
+custom_layout <- layout_with_fr(sle.fil.g_noself)
+
+
+### try to plot with normal plots
+#### NB: need to copy and paste into the console, cannot run from here
+dev.new(noRStudioGD = T)
+svg(filename = 'figures/graph_interactions_sle.svg',
+    onefile=T)
+plot(sle.fil.g_noself,
+     vertex.label = V(sle.fil.g)$name,
+     vertex.color = V(sle.fil.g)$color,
+     edge.color = adjustcolor("black", alpha.f = 0.5),
+     edge.width = 2^E(sle.fil.g)$log2.o.e,
+     layout = custom_layout,
+     vertex.label.family = "Arial",
+     vertex.label.color = 'black',
+     vertex.label.cex = 0.8,
+     vertex.size = 25)
+
+leg_incr <- c(2,5,10)
+
+legend("topleft",
+       legend=as.character(leg_incr),
+       col=adjustcolor("black", alpha.f=0.5),
+       lwd=c(leg_incr),
+       title="Obs/Exp Interactions")
+
+dev.off()
+
+
+### plot as heat-map type thing
+ggplot(subset(sle, p.adj < 0.01),
+       aes(x = ct1_abr,
+           y = ct2_abr,
+           size = log2.o.e,
+           color = log10(p.adj))) +
+  geom_point() +
+  scale_color_viridis_b() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## control
+## apply the key to the sle dataset
+ctrl$ct1_abr <- sapply(ctrl$ct1, function(c) {key_vector[c]})
+ctrl$ct2_abr <- sapply(ctrl$ct2, function(c) {key_vector[c]})
+
+ctrl.fil.g <- graph_from_data_frame(ctrl[which(ctrl$p.adj < 0.01),
+                                                      c('ct1_abr',
+                                                        'ct2_abr',
+                                                        'log2.o.e',
+                                                        'p.adj'
+                                                        )],
+                                   directed = F)
+
+ctrl.fil.g <- set_vertex_attr(ctrl.fil.g, "color", value = colors[get.vertex.attribute(ctrl.fil.g, "name")])
+
+## remove self-interacting nodes
+g <- ctrl.fil.g
+ctrl.fil.g_noself <- igraph::simplify(g, remove.loops = TRUE)
+custom_layout <- layout_with_fr(ctrl.fil.g_noself)
+
+
+### try to plot with normal plots
+#### NB: need to copy and paste into the console, cannot run from here
+dev.new(noRStudioGD = T)
+svg(filename = 'figures/graph_interactions_ctrl.svg',
+    onefile=T)
+plot(ctrl.fil.g_noself,
+     vertex.label = V(ctrl.fil.g)$name,
+     vertex.color = V(ctrl.fil.g)$color,
+     edge.color = adjustcolor("black", alpha.f = 0.5),
+     edge.width = 2^E(ctrl.fil.g)$log2.o.e,
+     layout = custom_layout,
+     vertex.label.family = "Arial",
+     vertex.label.color = 'black',
+     vertex.label.cex = 0.8,
+     vertex.size = 25)
+
+leg_incr <- c(2,5,10)
+
+legend("bottomright",
+       legend=as.character(leg_incr),
+       col=adjustcolor("black", alpha.f=0.5),
+       lwd=c(leg_incr),
+       title="Obs/Exp Interactions")
+
+dev.off()
+
+
+
+```
+
+
+
+
+
+### Hypergeometric dist subclusts
+
+Repeating the analysis above but including B-cell subclusters
+
+```{r}
+# update annot dataframe to combine B-cell subclusters in a new column, "clust_bcellsubcl"
+annot$clust_bcellsubcl <- annot$clust
+bcellrows <- which(annot$clust %in% c('B-cell', 'plasmablast'))
+row.names(bcell_seurat@meta.data) <- bcell_seurat@meta.data$cell_ID
+annot[bcellrows,'clust_bcellsubcl'] <- as.character(bcell_seurat@meta.data[annot$cell_ID[bcellrows],
+                                                                               'bcell_subclust'])
+
+annot_norbcs <- annot[which(!(is.na(annot$clust_bcellsubcl))),]
+
+
+# Combine T cell subsets in the clust_bcellsubcl
+tcells <- subset(annot, ((basictype == 'tcell_cd4') | (basictype == 'tcell_cd8')))$cell_ID
+annot[tcells,]$clust_bcellsubcl <- annot[tcells,'basictype']
+
+# get an adjacency matrix for all subcluster cells
+adj_matrices_subclust <- lapply(dists, function(d) { 
+  tmp <- annot_norbcs[which(annot_norbcs$cell_ID %in% colnames(as.matrix(d))), c('cell_ID', 'clust_bcellsubcl')]
+  annot_list <- tmp$clust_bcellsubcl
+  names(annot_list) <- tmp$cell_ID
+  return(make_adj_mat(d,
+                      annot_list,
+                      0.1))
+  }); names(adj_matrices_subclust) <- names(dists)
+
+
+# get parameters for hypergeometric distribution
+adj_matrix_hyperparams_subclust <- lapply(seq(1, length(adj_matrices_subclust)), function(n) {
+  print(n)
+  ## define the number of cell types within each distance matrix using the annot dataframe
+  ### get the cells from the annotation dataframe
+  nctypes <- table(annot_norbcs[which(annot_norbcs$cell_ID %in% colnames(as.matrix(dists[[n]]))), 'clust_bcellsubcl'])
+  ### reorder the nctypes to be the same as the columns in the dataset
+  nctypes <- nctypes[colnames(adj_matrices_subclust[[n]])]
+  out <- adj_mat_to_hypergeo_params(adj_matrices_subclust[[n]],
+                       nctypes)
+  out$tissue <- names(dists)[n]
+  return(out)
+}) %>% bind_rows()
+
+# look at subclusters in control vs lupus samples
+adj_matrix_hyperparams_subclust$disease <- 'control'
+adj_matrix_hyperparams_subclust[which(adj_matrix_hyperparams_subclust$tissue %in% sle_samples),
+                       'disease'] <- 'sle'
+
+sle.v.control_subclust <- adj_matrix_hyperparams_subclust %>% 
+  dplyr::group_by(ct1, ct2, disease) %>%
+  summarise(m = sum(m),
+            n = sum(n),
+            k = sum(k),
+            x = sum(x),
+            expected.edges = max(c(qhyper(p=0.5,
+                                          m = sum(m),
+                                          k = sum(k),
+                                          n = sum(n)),
+                                   0.5)),
+            p.val = max(c(phyper(q=sum(x),
+                                 m=sum(m),
+                                 k=sum(k),
+                                 n=sum(n),
+                                 lower.tail = F,
+                                 log.p = F),
+                          1e-30)))
+
+
+# add log2FC of observed over expected
+sle.v.control_subclust$log2.o.e <- log2(sle.v.control_subclust$x/sle.v.control_subclust$expected.edges)
+# add simple ratio
+sle.v.control_subclust$o.e <- sle.v.control_subclust$x/sle.v.control_subclust$expected.edges
+
+## adjust p-value for sle and controls separately
+### sle
+sle <- sle.v.control_subclust[which(sle.v.control_subclust$disease == 'sle'),]
+sle$p.adj <- p.adjust(sle$p.val,
+                      method = 'BH')
+sle[which(sle$p.adj == 0),'p.adj'] <- 1e-30
+
+### control
+ctrl <- sle.v.control_subclust[which(sle.v.control_subclust$disease == 'control'),]            
+ctrl$p.adj <- p.adjust(ctrl$p.val,
+                      method = 'BH')
+
+
+
+# plot the results
+## apply the key to the sle dataset
+sle$ct1_abr <- sapply(sle$ct1, function(c) {key_vector[c]})
+sle$ct2_abr <- sapply(sle$ct2, function(c) {key_vector[c]})
+
+## sle
+sle.fil.g <- graph_from_data_frame(sle[which(sle$p.adj < 0.01),
+                                                      c('ct1_abr',
+                                                        'ct2_abr',
+                                                        'log2.o.e',
+                                                        'p.adj'
+                                                        )],
+                                   directed = F)
+
+sle.fil.g <- set_vertex_attr(sle.fil.g, "color", value = colors[get.vertex.attribute(sle.fil.g, "name")])
+
+## remove self-interacting nodes
+g <- sle.fil.g
+sle.fil.g_noself <- igraph::simplify(g, remove.loops = TRUE)
+custom_layout <- layout_with_fr(sle.fil.g_noself)
+
+
+### try to plot with normal plots
+#### NB: need to copy and paste into the console, cannot run from here
+dev.new(noRStudioGD = T)
+svg(filename = 'figures/graph_interactions_sle.svg',
+    onefile=T)
+plot(sle.fil.g_noself,
+     vertex.label = V(sle.fil.g)$name,
+     vertex.color = V(sle.fil.g)$color,
+     edge.color = adjustcolor("black", alpha.f = 0.5),
+     edge.width = 2^E(sle.fil.g)$log2.o.e,
+     layout = custom_layout,
+     vertex.label.family = "Arial",
+     vertex.label.color = 'black',
+     vertex.label.cex = 0.8,
+     vertex.size = 25)
+
+leg_incr <- c(2,5,10)
+
+legend("topleft",
+       legend=as.character(leg_incr),
+       col=adjustcolor("black", alpha.f=0.5),
+       lwd=c(leg_incr),
+       title="Obs/Exp Interactions")
+
+dev.off()
+
+
+## control
+## apply the key to the sle dataset
+ctrl$ct1_abr <- sapply(ctrl$ct1, function(c) {key_vector[c]})
+ctrl$ct2_abr <- sapply(ctrl$ct2, function(c) {key_vector[c]})
+
+ctrl.fil.g <- graph_from_data_frame(ctrl[which(ctrl$p.adj < 0.01),
+                                                      c('ct1_abr',
+                                                        'ct2_abr',
+                                                        'log2.o.e',
+                                                        'p.adj'
+                                                        )],
+                                   directed = F)
+
+ctrl.fil.g <- set_vertex_attr(ctrl.fil.g, "color", value = colors[get.vertex.attribute(ctrl.fil.g, "name")])
+
+## remove self-interacting nodes
+g <- ctrl.fil.g
+ctrl.fil.g_noself <- igraph::simplify(g, remove.loops = TRUE)
+custom_layout <- layout_with_fr(ctrl.fil.g_noself)
+
+
+### try to plot with normal plots
+#### NB: need to copy and paste into the console, cannot run from here
+dev.new(noRStudioGD = T)
+svg(filename = 'figures/graph_interactions_ctrl.svg',
+    onefile=T)
+plot(ctrl.fil.g_noself,
+     vertex.label = V(ctrl.fil.g)$name,
+     vertex.color = V(ctrl.fil.g)$color,
+     edge.color = adjustcolor("black", alpha.f = 0.5),
+     edge.width = 2^E(ctrl.fil.g)$log2.o.e,
+     layout = custom_layout,
+     vertex.label.family = "Arial",
+     vertex.label.color = 'black',
+     vertex.label.cex = 0.8,
+     vertex.size = 25)
+
+leg_incr <- c(2,5,10)
+
+legend("topright",
+       legend=as.character(leg_incr),
+       col=adjustcolor("black", alpha.f=0.5),
+       lwd=c(leg_incr),
+       title="Obs/Exp Interactions")
+
+dev.off()
+
+
+```
+
+
+### Proportion of each interaction type that occur within hotspots vs other areas
+
+```{r}
+# make adjacency matrix of all immune cells
+adj_matrices_imms <- lapply(dists, function(d) { 
+  tmp <- annot[which(annot$cell_ID %in% rownames(as.matrix(d))), c('cell_ID', 'clust_bcellsubcl')]
+  annot_list <- tmp$clust
+  names(annot_list) <- tmp$cell_ID
+  return(make_adj_mat(d,
+                      annot_list,
+                      0.1,
+                      collapse_query = F)) }) %>%
+  bind_rows() %>% 
+  ## merge in information about location of the query cells
+  merge(.,
+        bcell_seurat@meta.data[,c('cell_ID',
+                                  'disease',
+                                  'context')],
+        by.x = 'row.names',
+        by.y = 'cell_ID')
+  
+  ## rename the cell_ID column
+  colnames(adj_matrices_imms)[1] <- "cell_ID"
+  
+  ## replace NA with 0
+  adj_matrices_imms <- replace(adj_matrices_imms, is.na(adj_matrices_imms), 0)
+
+# filter for just B.3 cells in LN
+# make a dataframe with the number of interactions for each group within each context
+cell_types <- colnames(adj_matrices_imms)[2:13]
+df <- adj_matrices_imms %>% subset(celltype == 'B.3' & 
+                                     disease == 'LN') %>%
+  group_by(context) %>%
+  summarise(across(all_of(cell_types), sum, .names = "{.col}")) %>%
+  t(.) %>% as.data.frame(); colnames(df) <- df[1,]; df <- df[-1,]
+
+# melt the df such that it can be plotte in ggplot2
+df$interacting_cell <- row.names(df)
+df_plot <- melt(df, id.vars = 'interacting_cell')
+df_plot$value <- as.numeric(df_plot$value)
+df_plot_props <- df_plot %>% group_by(interacting_cell) %>% summarise(contex = variable,
+                                                                      prop_contex = value / sum(value))
+df_plot_ns <- df_plot %>% group_by(interacting_cell) %>% summarise(totn = sum(value))
+
+
+plt <- ggplot() + 
+  geom_bar(data = df_plot_props,
+           aes(x = interacting_cell, 
+               y = prop_contex, 
+               fill = contex),
+           color = 'black',
+           stat = 'identity') +
+  geom_text(data = df_plot_ns,
+            aes(x = interacting_cell,
+                y = 1.05,
+                angle = 45,
+                label = totn),
+            size = 3,
+            hjust = 0) +
+  scale_fill_manual(values = c('#80b1d3', '#fb8072', '#bebada', '#fdb462')) +
+  scale_y_continuous(expand = expand_scale(mult = c(0, 0.12)),
+                     breaks = seq(0,1,0.25)) +
+  scale_x_discrete(expand = expand_scale(mult = c(0, 0.1))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank()) +
+  xlab(label = 'B.3-interacting Cell') +
+  labs(fill = "Context")
+  
+  
+ggsave(plt,
+       file = 'figures/B3_interactioncontext_SLE.svg',
+       width = 5,
+       height = 3.5,
+       device = svg)
+
+```
+
